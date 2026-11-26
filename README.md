@@ -20,6 +20,7 @@ The joke lands in one glance: told to take initiative, the agent took the whole 
 
 ```sh
 OUTPUT_DIR=./out node main.ts
+node main.ts --self-test   # gate checks against bad inputs (6 cases)
 ```
 
 ---

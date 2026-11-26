@@ -20,6 +20,7 @@
  *
  * Run it:
  *   OUTPUT_DIR=./out node main.ts        # local check
+ *   node main.ts --self-test              # gate checks against bad inputs
  *   node main.ts                          # grader: writes /output/entry.png
  */
 
@@ -49,7 +50,7 @@ export interface PngInfo {
 /**
  * Parse a PNG's IHDR chunk and return its dimensions. Throws on anything
  * that is not a whole, well-formed PNG header: wrong signature, a first
- * chunk that is not IHDR, or a buffer too short to hold one.
+ * chunk that is not IHDR, a bad IHDR CRC, or a buffer too short to hold one.
  */
 export function parsePng(buffer: Buffer): PngInfo {
   if (buffer.length < 33) {
@@ -63,12 +64,40 @@ export function parsePng(buffer: Buffer): PngInfo {
   if (ihdrType !== "IHDR" || ihdrLength !== 13) {
     throw new Error(`not a PNG: first chunk is ${ihdrType} (${ihdrLength} bytes), not IHDR`);
   }
+  const storedCrc = buffer.readUInt32BE(29);
+  const actualCrc = crc32(buffer.subarray(12, 29));
+  if (storedCrc !== actualCrc) {
+    throw new Error(
+      `not a PNG: IHDR CRC mismatch (stored ${storedCrc}, computed ${actualCrc})`,
+    );
+  }
   return {
     width: buffer.readUInt32BE(16),
     height: buffer.readUInt32BE(20),
     bitDepth: buffer[24],
     colorType: buffer[25],
   };
+}
+
+// CRC-32 (IEEE, polynomial 0xEDB88320), as PNG chunks store it.
+const CRC_TABLE: Uint32Array = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+export function crc32(data: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 /**
@@ -100,6 +129,51 @@ export function outputDir(): string {
   return process.env.OUTPUT_DIR ?? "/output";
 }
 
+/**
+ * Self-test: the gate must accept the real asset and refuse every bad
+ * input — a bad signature, a truncated file, a corrupted IHDR CRC, an
+ * image over the dimension cap, and a file over the byte cap. Exits
+ * non-zero on the first surprise, so a broken validator can never hide.
+ */
+export function selfTest(asset: Buffer): void {
+  const cases: Array<{ name: string; bytes: Buffer; accept: boolean }> = [];
+  cases.push({ name: "real asset", bytes: asset, accept: true });
+
+  const badSig = Buffer.from(asset);
+  badSig[0] = 0x00;
+  cases.push({ name: "bad signature", bytes: badSig, accept: false });
+
+  cases.push({ name: "truncated", bytes: asset.subarray(0, 20), accept: false });
+
+  const badCrc = Buffer.from(asset);
+  badCrc[16] ^= 0xff; // flip a width byte: CRC no longer matches
+  cases.push({ name: "corrupt IHDR CRC", bytes: badCrc, accept: false });
+
+  const wide = Buffer.from(asset);
+  wide.writeUInt32BE(2048, 16);
+  wide.writeUInt32BE(crc32(wide.subarray(12, 29)), 29); // re-seal the CRC
+  cases.push({ name: "2048px wide", bytes: wide, accept: false });
+
+  const huge = Buffer.concat([asset, Buffer.alloc(GATE.maxBytes)]);
+  cases.push({ name: "over 1 MiB", bytes: huge, accept: false });
+
+  let passed = 0;
+  for (const { name, bytes, accept } of cases) {
+    let ok = true;
+    try {
+      validateEntry(bytes);
+    } catch {
+      ok = false;
+    }
+    if (ok !== accept) {
+      throw new Error(`self-test FAILED: ${name} was ${ok ? "accepted" : "refused"}, expected ${accept ? "accept" : "refuse"}`);
+    }
+    passed++;
+    console.log(`self-test ok: ${name} -> ${accept ? "accepted" : "refused"}`);
+  }
+  console.log(`self-test: ${passed}/${cases.length} cases passed`);
+}
+
 function main(): void {
   const here = dirname(fileURLToPath(import.meta.url));
   const source = join(here, "assets", "meme.png");
@@ -107,6 +181,10 @@ function main(): void {
     throw new Error(`entry asset missing: ${source}`);
   }
   const bytes = readFileSync(source);
+  if (process.argv.includes("--self-test")) {
+    selfTest(bytes);
+    return;
+  }
   const info = validateEntry(bytes);
 
   const dir = outputDir();
